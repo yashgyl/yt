@@ -1,0 +1,151 @@
+const { google } = require("googleapis");
+const json2xls = require("json2xls");
+const fs = require("fs");
+const puppeteer = require("puppeteer");
+const emailExtractor = require("node-email-extractor").default;
+const countryLookup = require("country-code-lookup");
+
+const QUERY = "vlog";
+const MAX_RESULTS = 50;
+const EXPORT_FILE_NAME = "ytfitnessdata.xlsx";
+const ALLOWED_COUNTRIES = ["GB", "US", "CA"]; // UK, US, Canada
+
+// YouTube Data API configuration
+const API_KEY = "AIzaSyAEungdHiJsUD8zZ2PvYGfxVK28ADS5gYw";
+const youtube = google.youtube({
+  version: "v3",
+  auth: API_KEY,
+});
+
+let exportData = [];
+
+(async () => {
+  try {
+    const response = await youtube.search.list({
+      part: "snippet",
+      q: QUERY,
+      maxResults: MAX_RESULTS,
+      type: "channel",
+      regionCode: "US", // Default to US region for search
+    });
+
+    const items = response.data.items;
+    console.log(`You got ${items.length} results for your query`);
+
+    for (const item of items) {
+      const channelData = {};
+
+      // Check if the channel is from an allowed country
+      const channelId = item.id.channelId;
+      const channelRegion = await getChannelRegion(channelId);
+      if (!channelRegion || !ALLOWED_COUNTRIES.includes(channelRegion)) {
+        console.log(
+          `Skipping channel ${channelId} - Not from allowed countries.`
+        );
+        continue;
+      }
+
+      // Extract channel details
+      channelData["channel_title"] = item.snippet.title;
+      channelData["channel_description"] = item.snippet.description;
+      channelData["channel_published_at"] = item.snippet.publishedAt;
+      channelData["country"] = channelRegion; // Add country name field
+      channelData["subscribers_count"] = await getSubscribersCount(channelId); // Add subscribers count field
+
+      // Scrape channel page to extract business emails
+      const businessEmails = await scrapeBusinessEmails(channelId);
+      channelData["business_emails"] = businessEmails.join(", ");
+
+      // Add channel data to exportData array
+      exportData.push(channelData);
+    }
+
+    await writeToFile();
+  } catch (err) {
+    console.error(err);
+  }
+})();
+
+async function getChannelRegion(channelId) {
+  try {
+    const response = await youtube.channels.list({
+      part: "snippet",
+      id: channelId,
+    });
+
+    const channel = response.data.items[0];
+    if (channel && channel.snippet.country) {
+      return channel.snippet.country;
+    }
+    return null;
+  } catch (err) {
+    console.error("Error getting channel region:", err);
+    return null;
+  }
+}
+
+async function getSubscribersCount(channelId) {
+  try {
+    const response = await youtube.channels.list({
+      part: "statistics",
+      id: channelId,
+    });
+
+    const channel = response.data.items[0];
+    if (channel && channel.statistics && channel.statistics.subscriberCount) {
+      return channel.statistics.subscriberCount;
+    }
+    return null;
+  } catch (err) {
+    console.error("Error getting subscribers count:", err);
+    return null;
+  }
+}
+
+async function scrapeBusinessEmails(channelId) {
+  try {
+    const browser = await puppeteer.launch();
+    const page = await browser.newPage();
+    await page.goto(`https://www.youtube.com/channel/${channelId}/about`);
+
+    // Wait for the channel description section to be visible
+    await page.waitForSelector("#description-container #description");
+
+    // Extract business emails from the channel's description
+    const descriptionElement = await page.$(
+      "#description-container #description"
+    );
+    const descriptionText = await page.evaluate(
+      (el) => el.textContent,
+      descriptionElement
+    );
+    const emails = emailExtractor.text(descriptionText).emails;
+
+    await browser.close();
+
+    return emails;
+  } catch (err) {
+    console.error("Error scraping business emails:", err);
+    return [];
+  }
+}
+
+async function writeToFile() {
+  try {
+    // Map the exportData array to include the new fields
+    const mappedData = exportData.map((item) => ({
+      channel_title: item.channel_title,
+      channel_description: item.channel_description,
+      channel_published_at: item.channel_published_at,
+      country: item.country,
+      subscribers_count: item.subscribers_count,
+      business_emails: item.business_emails,
+    }));
+
+    const xls = json2xls(mappedData);
+    fs.writeFileSync(EXPORT_FILE_NAME, xls, "binary");
+    console.log("Data exported successfully!");
+  } catch (e) {
+    console.error("Export error! " + e);
+  }
+}
